@@ -1,94 +1,132 @@
-import express from 'express';
-import JSZip from 'jszip';
-import multer from 'multer';
+const express = require('express');
+const sharp   = require('sharp');
+const multer  = require('multer');
 
-const app = express();
-const upload = multer();
+const app    = express();
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
 
-// In-memory session store: { sessionId: { files: [{name, buffer}], createdAt } }
-const sessions = new Map();
+app.use(express.json({ limit: '50mb' }));
 
-// Clean up sessions older than 10 minutes
-setInterval(() => {
-  const cutoff = Date.now() - 10 * 60 * 1000;
-  for (const [id, session] of sessions) {
-    if (session.createdAt < cutoff) sessions.delete(id);
+// ── Health check ──────────────────────────────────────────────────────────────
+app.get('/', (req, res) => res.json({ status: 'ok', service: 'svg-converter' }));
+
+// ── SVG Cleaner ───────────────────────────────────────────────────────────────
+function cleanAndResizeSvg(svgBuffer, canvasWidth, canvasHeight, bleedMm) {
+  let svg = svgBuffer.toString('utf8');
+
+  // 1. CLEAN METADATA
+  svg = svg.replace(/<\?xml[^?]*\?>/gi, '');
+  svg = svg.replace(/<!--[\s\S]*?-->/g, '');
+  svg = svg.replace(/<sodipodi:[^>]*\/>/gi, '');
+  svg = svg.replace(/<inkscape:[^>]*\/>/gi, '');
+  svg = svg.replace(/\s(sodipodi|inkscape):[a-z-]+="[^"]*"/gi, '');
+  svg = svg.replace(/<defs>\s*<\/defs>/gi, '');
+  svg = svg.replace(/<g[^>]*>\s*<\/g>/gi, '');
+
+  // 2. REMOVE WHITE BACKGROUND RECTS
+  svg = svg.replace(/<rect[^>]*fill="(?:white|#fff|#ffffff|#FFFFFF)"[^>]*\/>/gi, '');
+  svg = svg.replace(/<rect[^>]*fill='(?:white|#fff|#ffffff)'[^>]*\/>/gi, '');
+
+  // 3. REMOVE STROKES
+  svg = svg.replace(/\bstroke="(?!none)[^"]*"/gi, 'stroke="none"');
+  svg = svg.replace(/\bstroke='(?!none)[^']*'/gi, "stroke='none'");
+  svg = svg.replace(/\bstroke-width="[^"]*"/gi, '');
+  svg = svg.replace(/\bstroke-width='[^']*'/gi, '');
+
+  // 4. GET VIEWBOX
+  const vbMatch = svg.match(/viewBox="([\d.,\s-]+)"/i) || svg.match(/viewBox='([\d.,\s-]+)'/i);
+  let vbX = 0, vbY = 0, vbW = 500, vbH = 500;
+  if (vbMatch) {
+    const parts = vbMatch[1].trim().split(/[\s,]+/).map(Number);
+    [vbX, vbY, vbW, vbH] = parts;
+  } else {
+    const wm = svg.match(/\bwidth="([\d.]+)"/i);
+    const hm = svg.match(/\bheight="([\d.]+)"/i);
+    if (wm) vbW = parseFloat(wm[1]);
+    if (hm) vbH = parseFloat(hm[1]);
   }
-}, 60 * 1000);
 
-// POST /upload — called once per SVG file from n8n loop
-// Body: multipart with field "file" (binary SVG)
-// Headers: x-session-id, x-file-name, x-total-files
-app.post('/upload', upload.single('file'), (req, res) => {
+  // 5. RESIZE + CENTER + BLEED
+  const BLEED_PX = Math.round(bleedMm * (300 / 25.4));
+  const SAFE_W   = canvasWidth  - BLEED_PX * 2;
+  const SAFE_H   = canvasHeight - BLEED_PX * 2;
+  const scale    = Math.min(SAFE_W / vbW, SAFE_H / vbH);
+  const offsetX  = BLEED_PX + (SAFE_W - vbW * scale) / 2 - vbX * scale;
+  const offsetY  = BLEED_PX + (SAFE_H - vbH * scale) / 2 - vbY * scale;
+
+  // 6. REWRITE SVG ROOT
+  svg = svg.replace(/<svg([^>]*)>/i, (_, attrs) => {
+    attrs = attrs
+      .replace(/\bwidth="[^"]*"/gi, '')
+      .replace(/\bheight="[^"]*"/gi, '')
+      .replace(/\bviewBox="[^"]*"/gi, '')
+      .replace(/\bpreserveAspectRatio="[^"]*"/gi, '')
+      .replace(/\bxmlns(:[a-z]+)?="[^"]*"/gi, '')
+      .replace(/\bxmlns(:[a-z]+)?='[^']*'/gi, '')
+      .trim();
+    return `<svg${attrs ? ' ' + attrs : ''} width="${canvasWidth}" height="${canvasHeight}" viewBox="0 0 ${canvasWidth} ${canvasHeight}" preserveAspectRatio="xMidYMid meet" xmlns="http://www.w3.org/2000/svg">`;
+  });
+
+  // 7. WRAP IN TRANSFORM
+  svg = svg.replace(
+    /(<svg[^>]*>)([\s\S]*)(<\/svg>)/i,
+    (_, open, inner, close) =>
+      `${open}<g transform="translate(${offsetX.toFixed(2)},${offsetY.toFixed(2)}) scale(${scale.toFixed(6)})">${inner}</g>${close}`
+  );
+
+  return Buffer.from(svg, 'utf8');
+}
+
+// ── POST /convert ─────────────────────────────────────────────────────────────
+// Accepts multipart/form-data with field "file" (SVG binary)
+// or application/json with field "svg" (SVG string, base64 or raw)
+// Optional params: width, height, density, compressionLevel, bleedMm
+// ─────────────────────────────────────────────────────────────────────────────
+app.post('/convert', upload.single('file'), async (req, res) => {
   try {
-    const sessionId = req.headers['x-session-id'];
-    const fileName  = req.headers['x-file-name'] || 'file.svg';
-    const total     = parseInt(req.headers['x-total-files'] || '0', 10);
+    const width            = parseInt(req.query.width            || req.body?.width            || 4500);
+    const height           = parseInt(req.query.height           || req.body?.height           || 5400);
+    const density          = parseInt(req.query.density          || req.body?.density          || 300);
+    const compressionLevel = parseInt(req.query.compressionLevel || req.body?.compressionLevel || 6);
+    const bleedMm          = parseFloat(req.query.bleedMm       || req.body?.bleedMm          || 3);
 
-    if (!sessionId) return res.status(400).json({ error: 'Missing x-session-id header' });
-    if (!req.file)  return res.status(400).json({ error: 'No file uploaded' });
+    let rawSvgBuffer;
 
-    // Get or create session
-    if (!sessions.has(sessionId)) {
-      sessions.set(sessionId, { files: [], total, createdAt: Date.now() });
+    if (req.file) {
+      rawSvgBuffer = req.file.buffer;
+    } else if (req.body?.svg) {
+      const raw = req.body.svg;
+      rawSvgBuffer = raw.trimStart().startsWith('<')
+        ? Buffer.from(raw, 'utf8')
+        : Buffer.from(raw, 'base64');
+    } else {
+      return res.status(400).json({ error: 'No SVG provided. Send multipart "file" field or JSON "svg" field.' });
     }
 
-    const session = sessions.get(sessionId);
-    const name = fileName.replace(/\.[^.]+$/, '.svg');
-    session.files.push({ name, buffer: req.file.buffer });
+    // Clean + resize SVG
+    const cleanedSvgBuffer = cleanAndResizeSvg(rawSvgBuffer, width, height, bleedMm);
 
-    console.log(`[${sessionId}] received ${session.files.length}/${session.total}: ${name}`);
+    // Convert to PNG
+    const pngBuffer = await sharp(cleanedSvgBuffer, { density })
+      .png({ compressionLevel })
+      .toBuffer();
 
-    res.json({
-      received: session.files.length,
-      total: session.total,
-      done: session.files.length >= session.total
+    const filename = (req.file?.originalname || 'output').replace(/\.[^.]+$/, '') + '.png';
+
+    res.set({
+      'Content-Type':        'image/png',
+      'Content-Disposition': `attachment; filename="${filename}"`,
+      'Content-Length':      pngBuffer.length,
+      'X-File-Name':         filename,
     });
 
+    res.send(pngBuffer);
+
   } catch (err) {
-    console.error('Upload error:', err);
-    res.status(500).json({ error: String(err) });
+    console.error('Convert error:', err);
+    res.status(500).json({ error: err.message });
   }
 });
 
-// POST /zip — called once after all files uploaded
-// Body: { sessionId }
-// Returns: zip file as binary
-app.use(express.json());
-app.post('/zip', async (req, res) => {
-  try {
-    const { sessionId } = req.body;
-    if (!sessionId) return res.status(400).json({ error: 'Missing sessionId' });
-
-    const session = sessions.get(sessionId);
-    if (!session) return res.status(404).json({ error: 'Session not found or expired' });
-    if (!session.files.length) return res.status(400).json({ error: 'No files in session' });
-
-    console.log(`[${sessionId}] zipping ${session.files.length} files`);
-
-    const zip = new JSZip();
-    for (const f of session.files) {
-      zip.file(f.name, f.buffer);
-    }
-
-    const zipBuffer = await zip.generateAsync({ type: 'nodebuffer', compression: 'DEFLATE' });
-
-    // Clean up session
-    sessions.delete(sessionId);
-
-    res.setHeader('Content-Type', 'application/zip');
-    res.setHeader('Content-Disposition', 'attachment; filename="svgs.zip"');
-    res.setHeader('Content-Length', zipBuffer.length);
-    res.send(zipBuffer);
-
-  } catch (err) {
-    console.error('ZIP error:', err);
-    res.status(500).json({ error: String(err) });
-  }
-});
-
-app.get('/health', (_, res) => res.json({ ok: true, sessions: sessions.size }));
-
-app.listen(process.env.PORT || 3000, () => {
-  console.log(`SVG ZIP service running on port ${process.env.PORT || 3000}`);
-});
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`svg-converter running on port ${PORT}`));
