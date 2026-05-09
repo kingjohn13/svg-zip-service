@@ -2,14 +2,16 @@ import express from 'express';
 import JSZip from 'jszip';
 
 const app = express();
-
-// Allow JSON up to ~50 MB
-app.use(express.json({ limit: '50mb' }));
+app.use(express.json({ limit: '50mb' })); // important
 
 app.post('/zip', async (req, res) => {
   try {
-    const { files } = req.body;  // [{ name, dataBase64 }]
-    if (!Array.isArray(files) || files.length === 0) {
+    console.log('Received /zip request');           // <--- add this
+    console.log('Body keys:', Object.keys(req.body || {}));
+
+    const { files } = req.body;
+    if (!Array.isArray(files) || !files.length) {
+      console.log('No files provided');
       return res.status(400).json({ error: 'No files provided' });
     }
 
